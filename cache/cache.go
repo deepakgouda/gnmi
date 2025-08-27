@@ -243,6 +243,10 @@ func (c *Cache) GetTarget(target string) *Target {
 	return c.targets[target]
 }
 
+func (c *Cache) GetTargets() map[string]*Target {
+	return c.targets
+}
+
 // HasTarget reports whether the specified target exists in the cache or a glob
 // (*) is passed which will match any target (even if no targets yet exist).
 func (c *Cache) HasTarget(target string) bool {

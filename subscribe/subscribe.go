@@ -27,15 +27,15 @@ import (
 	"time"
 
 	log "github.com/golang/glog"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/peer"
-	"google.golang.org/grpc/status"
-	"google.golang.org/protobuf/proto"
 	"github.com/openconfig/gnmi/cache"
 	"github.com/openconfig/gnmi/coalesce"
 	"github.com/openconfig/gnmi/ctree"
 	"github.com/openconfig/gnmi/match"
 	"github.com/openconfig/gnmi/path"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/peer"
+	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 
 	pb "github.com/openconfig/gnmi/proto/gnmi"
 )
@@ -245,6 +245,7 @@ func addSubscription(m *match.Match, s *pb.SubscriptionList, c *matchClient) (re
 // Subscribe is the entry point for the external RPC request of the same name
 // defined in gnmi.proto.
 func (s *Server) Subscribe(stream pb.GNMI_SubscribeServer) error {
+	log.Infof("~~~~~~Subscribe: %v~~~~~~", stream)
 	c := streamClient{stream: stream, acl: &aclStub{}}
 	var err error
 	if s.o.acl != nil {
@@ -268,6 +269,29 @@ func (s *Server) Subscribe(stream pb.GNMI_SubscribeServer) error {
 		return status.Errorf(codes.InvalidArgument, "request must contain a prefix %#v", c.sr)
 	case c.sr.GetSubscribe().GetPrefix().GetTarget() == "":
 		return status.Error(codes.InvalidArgument, "missing target")
+	}
+
+	runGetPeerSessionStates := false
+	for _, sub := range c.sr.GetSubscribe().Subscription {
+		p := sub.GetPath()
+		if p == nil {
+			continue
+		}
+		pathElems := path.ToStrings(p, false)
+		if len(pathElems) > 0 && pathElems[len(pathElems)-1] == "loc-rib" {
+			runGetPeerSessionStates = true
+			break
+		}
+	}
+	if runGetPeerSessionStates {
+		log.Infof("~~~~~~runGetPeerSessionStates: %v~~~~~~", c.sr)
+		peerState, err := s.GetPeerSessionStates()
+		if err != nil {
+			log.Errorf("Failed to get peer session states: %v", err)
+		}
+		for k, v := range peerState {
+			log.Infof("~~~~~~peer: %v, state: %v~~~~~~", k, v)
+		}
 	}
 
 	c.target = c.sr.GetSubscribe().GetPrefix().GetTarget()
@@ -412,6 +436,7 @@ func (s *Server) processSubscription(c *streamClient) {
 			if err != nil {
 				return
 			}
+			log.Infof("~~~~~~fullPath: %v~~~~~~", fullPath)
 			// Note that fullPath doesn't contain target name as the first element.
 			s.c.Query(c.target, fullPath, func(_ []string, l *ctree.Leaf, _ interface{}) error {
 				// Stop processing query results on error.
@@ -626,4 +651,43 @@ func (s *Server) ClientStats() map[string]ClientStats {
 		return nil
 	}
 	return s.o.stats.allClientStats()
+}
+
+func (s *Server) GetPeerSessionStates() (map[string]map[string]string, error) {
+	peerStates := make(map[string]map[string]string)
+	log.Infof("~~~~~~targets: %v~~~~~~", s.c.GetTargets())
+	for target := range s.c.GetTargets() {
+		peerStates[target] = make(map[string]string)
+		queryPath := []string{
+			"network-instances",
+			"network-instance[name=default]",
+			"protocols",
+			"protocol[identifier=BGP][name=BGP]",
+			"bgp",
+			"neighbors",
+			"neighbor",
+			"state",
+			"session-state",
+		}
+
+		err := s.c.Query(target, queryPath, func(p []string, l *ctree.Leaf, _ interface{}) error {
+			if l == nil {
+				return nil
+			}
+			val, ok := l.Value().(*pb.TypedValue)
+			if !ok {
+				return fmt.Errorf("unexpected type %T at path %v", l.Value(), p)
+			}
+
+			// The neighbor address is the second to last element in the path.
+			log.Infof("~~~~~~p: %v~~~~~~", p)
+			neighborAddr := p[len(p)-3]
+			peerStates[target][neighborAddr] = val.GetStringVal()
+			return nil
+		})
+		if err != nil {
+			return nil, fmt.Errorf("failed to query peer session states for target %s: %v", target, err)
+		}
+	}
+	return peerStates, nil
 }
