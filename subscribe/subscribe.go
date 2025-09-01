@@ -271,6 +271,8 @@ func (s *Server) Subscribe(stream pb.GNMI_SubscribeServer) error {
 		return status.Error(codes.InvalidArgument, "missing target")
 	}
 
+	c.target = c.sr.GetSubscribe().GetPrefix().GetTarget()
+
 	runGetPeerSessionStates := false
 	for _, sub := range c.sr.GetSubscribe().Subscription {
 		p := sub.GetPath()
@@ -285,16 +287,16 @@ func (s *Server) Subscribe(stream pb.GNMI_SubscribeServer) error {
 	}
 	if runGetPeerSessionStates {
 		log.Infof("~~~~~~runGetPeerSessionStates: %v~~~~~~", c.sr)
-		peerState, err := s.GetPeerSessionStates()
+		peerState, err := s.GetPeerSessionStates(&c, c.target)
 		if err != nil {
-			log.Errorf("Failed to get peer session states: %v", err)
-		}
-		for k, v := range peerState {
-			log.Infof("~~~~~~peer: %v, state: %v~~~~~~", k, v)
+			log.Errorf("Failed to get peer session states for target %v: %v", c.target, err)
+		} else {
+			if len(peerState) > 0 {
+				log.Infof("~~~~~~peerState: %v~~~~~~", peerState)
+			}
 		}
 	}
 
-	c.target = c.sr.GetSubscribe().GetPrefix().GetTarget()
 	if !s.c.HasTarget(c.target) {
 		return status.Errorf(codes.NotFound, "no such target: %q", c.target)
 	}
@@ -436,10 +438,11 @@ func (s *Server) processSubscription(c *streamClient) {
 			if err != nil {
 				return
 			}
-			log.Infof("~~~~~~fullPath: %v~~~~~~", fullPath)
+			log.Infof("~~~~~~fullPath: %q~~~~~~", fullPath)
 			// Note that fullPath doesn't contain target name as the first element.
-			s.c.Query(c.target, fullPath, func(_ []string, l *ctree.Leaf, _ interface{}) error {
+			s.c.Query(c.target, fullPath, func(p []string, l *ctree.Leaf, _ interface{}) error {
 				// Stop processing query results on error.
+				log.Infof("~~~~~~full responses for target %v: path: %q, leaf: %v~~~~~~", c.target, p, l)
 				if err != nil {
 					return err
 				}
@@ -653,41 +656,70 @@ func (s *Server) ClientStats() map[string]ClientStats {
 	return s.o.stats.allClientStats()
 }
 
-func (s *Server) GetPeerSessionStates() (map[string]map[string]string, error) {
-	peerStates := make(map[string]map[string]string)
-	log.Infof("~~~~~~targets: %v~~~~~~", s.c.GetTargets())
-	for target := range s.c.GetTargets() {
-		peerStates[target] = make(map[string]string)
-		queryPath := []string{
-			"network-instances",
-			"network-instance[name=default]",
-			"protocols",
-			"protocol[identifier=BGP][name=BGP]",
-			"bgp",
-			"neighbors",
-			"neighbor",
-			"state",
-			"session-state",
-		}
+// GetPeerSessionStates: Dummy comment here
+func (s *Server) GetPeerSessionStates(c *streamClient, target string) (map[string]string, error) {
+	peerStates := make(map[string]string)
+	if !s.c.HasTarget(target) {
+		return nil, fmt.Errorf("target %s not found in cache", target)
+	}
 
-		err := s.c.Query(target, queryPath, func(p []string, l *ctree.Leaf, _ interface{}) error {
-			if l == nil {
-				return nil
-			}
-			val, ok := l.Value().(*pb.TypedValue)
-			if !ok {
-				return fmt.Errorf("unexpected type %T at path %v", l.Value(), p)
-			}
+	// Construct the path using pb.Path
+	fullPath := &pb.Path{
+		Elem: []*pb.PathElem{
+			{Name: "openconfig"},
+			{Name: "network-instances"},
+			{Name: "network-instance", Key: map[string]string{"name": "DEFAULT"}},
+			{Name: "protocols"},
+			{Name: "protocol", Key: map[string]string{"identifier": "BGP", "name": "BGP"}},
+			{Name: "bgp"},
+			{Name: "neighbors"},
+			{Name: "neighbor", Key: map[string]string{"neighbor-address": "*"}},
+			{Name: "state"},
+			{Name: "session-state"},
+		},
+	}
+	fullPathStr := path.ToStrings(fullPath, false)
 
-			// The neighbor address is the second to last element in the path.
-			log.Infof("~~~~~~p: %v~~~~~~", p)
-			neighborAddr := p[len(p)-3]
-			peerStates[target][neighborAddr] = val.GetStringVal()
+	err := s.c.Query(target, fullPathStr, func(p []string, l *ctree.Leaf, _ any) error {
+		if l == nil {
+			log.Warningf("Received nil leaf at path %v for target %s", p, target)
 			return nil
-		})
-		if err != nil {
-			return nil, fmt.Errorf("failed to query peer session states for target %s: %v", target, err)
 		}
+		notification, ok := l.Value().(*pb.Notification)
+		if !ok {
+			log.Errorf("Unexpected type %T at path %v for target %s", l.Value(), p, target)
+			return fmt.Errorf("unexpected type %T at path %v", l.Value(), p)
+		}
+		for _, update := range notification.GetUpdate() {
+			sessionState := update.GetVal().GetStringVal()
+			if sessionState == "" {
+				continue
+			}
+
+			var neighborAddr string
+			for _, elem := range update.GetPath().GetElem() {
+				if elem.GetName() == "neighbor" {
+					if addr, ok := elem.GetKey()["neighbor-address"]; ok {
+						neighborAddr = addr
+						break
+					}
+				}
+			}
+			if neighborAddr == "" {
+				log.Warningf("Could not find neighbor-address in update path for target %s: %v", target, update.GetPath())
+				continue
+			}
+			peerStates[neighborAddr] = sessionState
+			log.Infof("Found session state for target %s, neighbor %s: %s", target, neighborAddr, sessionState)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to query peer session states for target %s: %v", target, err)
+	}
+
+	if len(peerStates) == 0 {
+		log.Warningf("No peer session states found for target %s with path %v", target, fullPathStr)
 	}
 	return peerStates, nil
 }
