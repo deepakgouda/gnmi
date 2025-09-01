@@ -140,9 +140,10 @@ func WithoutDupReport() Option {
 type Server struct {
 	pb.UnimplementedGNMIServer // Stub out all RPCs except Subscribe.
 
-	c *cache.Cache // The cache queries are performed against.
-	m *match.Match // Structure to match updates against active subscriptions.
-	o options
+	c                 *cache.Cache // The cache queries are performed against.
+	m                 *match.Match // Structure to match updates against active subscriptions.
+	o                 options
+	peerSessionStates map[string]string // Peer session states for each neighbor.
 }
 
 // NewServer instantiates server to handle client queries.  The cache should be
@@ -157,7 +158,7 @@ func NewServer(c *cache.Cache, opts ...Option) (*Server, error) {
 	if o.timeout == 0 {
 		o.timeout = time.Minute
 	}
-	return &Server{c: c, m: match.New(), o: o}, nil
+	return &Server{c: c, m: match.New(), o: o, peerSessionStates: make(map[string]string)}, nil
 }
 
 // UpdateNotification uses paths in a pb.Notification n to match registered
@@ -291,8 +292,32 @@ func (s *Server) Subscribe(stream pb.GNMI_SubscribeServer) error {
 		if err != nil {
 			log.Errorf("Failed to get peer session states for target %v: %v", c.target, err)
 		} else {
+			s.peerSessionStates = peerState
 			if len(peerState) > 0 {
 				log.Infof("~~~~~~peerState: %v~~~~~~", peerState)
+				var updates []*pb.Update
+				for neighbor, state := range peerState {
+					u := &pb.Update{
+						Path: &pb.Path{
+							Elem: []*pb.PathElem{
+								{Name: "peer-session-state"},
+								{Name: neighbor},
+							},
+						},
+						Val: &pb.TypedValue{
+							Value: &pb.TypedValue_StringVal{StringVal: state},
+						},
+					}
+					updates = append(updates, u)
+				}
+				notification := &pb.Notification{
+					Prefix: c.sr.GetSubscribe().GetPrefix(),
+					Update: updates,
+				}
+				if err := stream.Send(&pb.SubscribeResponse{Response: &pb.SubscribeResponse_Update{Update: notification}}); err != nil {
+					log.Errorf("Failed to send peer session state notification to client: %v", err)
+					return err
+				}
 			}
 		}
 	}
@@ -431,6 +456,85 @@ func (s *Server) processSubscription(c *streamClient) {
 		}
 		log.V(2).Infof("end processSubscription for %p", c)
 	}()
+	if len(s.peerSessionStates) > 0 {
+		log.Infof("~~~~~~Peer session states in processSubscription: %v~~~~~~", s.peerSessionStates)
+
+		for neighborAddr := range s.peerSessionStates {
+			fullPath := &pb.Path{
+				Elem: []*pb.PathElem{
+					{Name: "openconfig"},
+					{Name: "network-instances"},
+					{Name: "network-instance", Key: map[string]string{"name": "DEFAULT"}},
+					{Name: "protocols"},
+					{Name: "protocol", Key: map[string]string{"identifier": "BGP", "name": "BGP"}},
+					{Name: "bgp"},
+					{Name: "rib"},
+					{Name: "afi-safis"},
+					{Name: "afi-safi", Key: map[string]string{"afi-safi-name": "IPV4_UNICAST"}},
+					{Name: "ipv4-unicast"},
+					{Name: "neighbors"},
+					{Name: "neighbor", Key: map[string]string{"neighbor-address": neighborAddr}},
+					{Name: "adj-rib-in-pre"},
+					{Name: "routes"},
+					{Name: "route", Key: map[string]string{"prefix": "*", "path-id": "*"}},
+					{Name: "state"},
+				},
+			}
+			fullPathStr := path.ToStrings(fullPath, false)
+
+			log.Infof("Querying adj-rib-in-pre for neighbor %s on target %s", neighborAddr, c.target)
+			err = s.c.Query(c.target, fullPathStr, func(p []string, l *ctree.Leaf, _ any) error {
+				if err != nil {
+					return err
+				}
+				log.Infof("~~~~~~adj-rib-in-pre response for target %v, neighbor %s: path: %q, leaf: %v~~~~~~", c.target, neighborAddr, p, l)
+				log.Infof("~~~~~~adj-rib-in-pre leaf value: %v~~~~~~", l.Value())
+				_, err = c.queue.Insert(l)
+				return err
+			})
+			if err != nil {
+				log.Errorf("Error querying adj-rib-in-pre for neighbor %s on target %s: %v", neighborAddr, c.target, err)
+				// Continue to the next neighbor if one query fails
+			}
+			// Send End-Of-RIB marker here.
+			eorPath := &pb.Path{
+				Elem: []*pb.PathElem{
+					{Name: "openconfig"},
+					{Name: "network-instances"},
+					{Name: "network-instance", Key: map[string]string{"name": "DEFAULT"}},
+					{Name: "protocols"},
+					{Name: "protocol", Key: map[string]string{"identifier": "BGP", "name": "BGP"}},
+					{Name: "bgp"},
+					{Name: "rib"},
+					{Name: "afi-safis"},
+					{Name: "afi-safi", Key: map[string]string{"afi-safi-name": "IPV4_UNICAST"}},
+					{Name: "ipv4-unicast"},
+					{Name: "neighbors"},
+					{Name: "neighbor", Key: map[string]string{"neighbor-address": neighborAddr}},
+					{Name: "adj-rib-in-pre"},
+					{Name: "routes"},
+					{Name: "route", Key: map[string]string{"prefix": "0.0.0.0/0", "path-id": "4294967295"}},
+					{Name: "state"},
+				},
+			}
+			eorUpdate := &pb.Update{
+				Path: eorPath,
+				Val: &pb.TypedValue{
+					Value: &pb.TypedValue_JsonVal{JsonVal: []byte(`{"valid-route": false}`)}, // Indicate EOR
+				},
+			}
+			eorNotification := &pb.Notification{
+				Prefix: c.sr.GetSubscribe().GetPrefix(),
+				Update: []*pb.Update{eorUpdate},
+			}
+			_, err = c.queue.Insert(ctree.DetachedLeaf(eorNotification))
+			if err != nil {
+				log.Errorf("Error inserting End-of-RIB marker for neighbor %s on target %s: %v", neighborAddr, c.target, err)
+			} else {
+				log.Infof("~~~~~~Sent End-of-RIB marker for neighbor %s on target %s", neighborAddr, c.target)
+			}
+		}
+	}
 	if !c.sr.GetSubscribe().GetUpdatesOnly() {
 		for _, subscription := range c.sr.GetSubscribe().Subscription {
 			var fullPath []string
