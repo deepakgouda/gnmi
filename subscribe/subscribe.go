@@ -281,6 +281,9 @@ func (s *Server) Subscribe(stream pb.GNMI_SubscribeServer) error {
 			continue
 		}
 		pathElems := path.ToStrings(p, false)
+		// Ideally the path should be /network-instances/network-instance/protocols/protocol/bgp/rib/streaming/
+		// Since the OpenConfig RIB Streaming path could not be created (yet),
+		// I have substituted the check with `loc-rib`
 		if len(pathElems) > 0 && pathElems[len(pathElems)-1] == "loc-rib" {
 			runGetPeerSessionStates = true
 			break
