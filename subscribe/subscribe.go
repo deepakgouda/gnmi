@@ -290,6 +290,8 @@ func (s *Server) Subscribe(stream pb.GNMI_SubscribeServer) error {
 		}
 	}
 	if runGetPeerSessionStates {
+		// If the client is subscribing to the RIB streaming OpenConfig path, start the subscription by
+		// sending Peer Session State information
 		log.Infof("~~~~~~runGetPeerSessionStates: %v~~~~~~", c.sr)
 		peerState, err := s.GetPeerSessionStates(&c, c.target)
 		if err != nil {
